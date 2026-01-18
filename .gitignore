@@ -1,0 +1,14 @@
+node_modules/
+data/
+
+# Local/env files
+env_file.txt
+.env
+.env.*
+
+# OS/editor noise
+.DS_Store
+.vscode/
+
+# Generated analysis output
+sample_analysis.json
