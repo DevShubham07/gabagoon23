@@ -21,10 +21,12 @@
 require("dotenv").config();
 
 const { ClobClient, Side, OrderType } = require("@polymarket/clob-client");
+const { RealTimeDataClient } = require("@polymarket/real-time-data-client");
 const { Wallet } = require("ethers");
 
 const HOST = process.env.POLY_CLOB_HOST || "https://clob.polymarket.com";
 const CHAIN_ID = Number(process.env.POLY_CHAIN_ID || 137); // Polygon mainnet
+const RTDS_HOST = process.env.POLY_RTDS_HOST; // optional override; otherwise uses lib default
 
 function printUsage() {
   // Keep this short; refer user to Polymarket docs for auth details.
@@ -50,6 +52,8 @@ Options:
   --min-edge <p>        Minimum required pair edge: (1 - 2*price) >= min-edge (default: 0.005)
   --min-hedge-edge <p>  Minimum required edge after hedging the 2nd leg (default: 0.002)
   --allow-weird-quotes <true|false> Allow best ask/bid being 0 or ~1 without refusing (default: false)
+  --use-rtds <true|false>  Use RealTimeDataClient for realtime events (default: true)
+  --market-slug <slug>  (optional) Subscribe to activity events for this market slug
   --signature-type <0|1|2>  Default 0 (EOA). See Polymarket docs.
   --funder <address>    Funder address (default: signer.address)
   --min-mb <mb>         (not used here)
@@ -202,6 +206,8 @@ async function main() {
   const minEdgeArg = getArgValue("--min-edge");
   const minHedgeEdgeArg = getArgValue("--min-hedge-edge");
   const allowWeirdQuotesArg = getArgValue("--allow-weird-quotes");
+  const useRtdsArg = getArgValue("--use-rtds");
+  const marketSlugArg = getArgValue("--market-slug");
 
   const PRICE = priceArg !== undefined ? Number(priceArg) : Number(process.env.PRICE || 0.49);
   const INVEST_PER_SIDE =
@@ -215,6 +221,8 @@ async function main() {
   const MIN_EDGE = toNum(minEdgeArg ?? process.env.MIN_EDGE, 0.005);
   const MIN_HEDGE_EDGE = toNum(minHedgeEdgeArg ?? process.env.MIN_HEDGE_EDGE, 0.002);
   const ALLOW_WEIRD_QUOTES = toBool(allowWeirdQuotesArg ?? process.env.ALLOW_WEIRD_QUOTES, false);
+  const USE_RTDS = toBool(useRtdsArg ?? process.env.USE_RTDS, true);
+  const MARKET_SLUG = marketSlugArg ?? process.env.MARKET_SLUG; // optional
 
   const SIGNATURE_TYPE =
     signatureTypeArg !== undefined
@@ -337,6 +345,58 @@ async function main() {
   const cancelAtMs = Date.now() + DURATION_MIN * 60 * 1000;
   console.log(`[${nowIso()}] Will cancel remaining open orders in ${DURATION_MIN} minutes @ ${new Date(cancelAtMs).toISOString()}`);
 
+  // Optional RTDS client:
+  // - clob_user.order / clob_user.trade (authenticated) gives low-latency signals that *something* changed
+  // - activity.orders_matched/trades (unauth) can be subscribed by market_slug (if provided) for additional signals
+  // We still verify by calling getOrder(orderID) because RTDS payload schema doesn't guarantee an orderID linkage.
+  let rtdClient = null;
+  let rtdsTriggered = false;
+  if (USE_RTDS) {
+    try {
+      rtdClient = new RealTimeDataClient({
+        host: RTDS_HOST,
+        autoReconnect: true,
+        onConnect: (c) => {
+          console.log(`[${nowIso()}] RTDS connected. Subscribing…`);
+
+          // Auth subscription for user-specific events
+          const clob_auth = {
+            // clob-client uses apiKey naming; RTDS expects key
+            key: userApiCreds.apiKey ?? userApiCreds.key,
+            secret: userApiCreds.secret,
+            passphrase: userApiCreds.passphrase,
+          };
+
+          c.subscribe({
+            subscriptions: [
+              { topic: "clob_user", type: "order", clob_auth },
+              { topic: "clob_user", type: "trade", clob_auth },
+            ],
+          });
+
+          // Optional market-wide activity feed (requires market_slug filter)
+          if (MARKET_SLUG) {
+            c.subscribe({
+              subscriptions: [
+                { topic: "activity", type: "orders_matched", filters: JSON.stringify({ market_slug: MARKET_SLUG }) },
+                { topic: "activity", type: "trades", filters: JSON.stringify({ market_slug: MARKET_SLUG }) },
+              ],
+            });
+          }
+        },
+        onMessage: (_c, msg) => {
+          // We treat any user order/trade message as a hint to check our order status immediately.
+          if (msg?.topic === "clob_user") {
+            rtdsTriggered = true;
+          }
+        },
+      }).connect();
+    } catch (e) {
+      console.log(`[${nowIso()}] RTDS init failed, falling back to polling: ${e?.message || String(e)}`);
+      rtdClient = null;
+    }
+  }
+
   // Safety loop:
   // - Poll matched sizes (size_matched) for each order
   // - If one side fills and the other doesn't within PAIR_GRACE_SEC:
@@ -348,6 +408,16 @@ async function main() {
   let actedOnSingleFill = false;
 
   while (Date.now() < cancelAtMs) {
+    // If RTDS is enabled, we can poll less aggressively unless RTDS says something changed.
+    // (We still do periodic polling to avoid missing events.)
+    if (USE_RTDS && rtdClient) {
+      if (!rtdsTriggered) {
+        await sleep(Math.max(POLL_SEC, 3) * 1000);
+        continue;
+      }
+      rtdsTriggered = false;
+    }
+
     const upOrder = await safeGetOrder(client, upResp.orderID);
     const downOrder = await safeGetOrder(client, downResp.orderID);
 
@@ -441,6 +511,12 @@ async function main() {
     }
 
     await sleep(POLL_SEC * 1000);
+  }
+
+  if (rtdClient) {
+    try {
+      rtdClient.disconnect();
+    } catch {}
   }
 
   console.log(`[${nowIso()}] Cancelling orders (best-effort)…`);
