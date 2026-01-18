@@ -45,6 +45,8 @@ Options:
   --shares <n>          Override share size directly (instead of --invest)
   --duration-min <m>    Cancel open orders after m minutes (default: 15)
   --start-at <iso>      Wait until ISO timestamp before placing orders
+  --align-15m <true|false>  If --start-at not provided, align start to next 15m boundary (default: false)
+  --repeat <true|false>  Repeat forever in 15m windows (default: false)
   --post-only <true|false>  Post-only for the initial pair orders (default: true)
   --poll-sec <s>        Poll open order status every s seconds (default: 3)
   --pair-grace-sec <s>  If only one side fills, wait s seconds for the other fill before acting (default: 10)
@@ -91,6 +93,14 @@ function parseIsoMs(s) {
 
 function nowIso() {
   return new Date().toISOString();
+}
+
+function ceilToWindowMs(nowMs, windowMinutes) {
+  // Align to next N-minute boundary (UTC).
+  // Example windowMinutes=15 => 00:00,00:15,00:30,00:45...
+  const windowMs = windowMinutes * 60 * 1000;
+  const next = Math.ceil(nowMs / windowMs) * windowMs;
+  return next;
 }
 
 function roundDownToTick(x, tickSize) {
@@ -197,6 +207,8 @@ async function main() {
   const sharesArg = getArgValue("--shares");
   const durationMinArg = getArgValue("--duration-min");
   const startAtArg = getArgValue("--start-at");
+  const align15mArg = getArgValue("--align-15m");
+  const repeatArg = getArgValue("--repeat");
   const signatureTypeArg = getArgValue("--signature-type");
   const funderArg = getArgValue("--funder");
   const postOnlyArg = getArgValue("--post-only");
@@ -214,6 +226,8 @@ async function main() {
     investArg !== undefined ? Number(investArg) : Number(process.env.INVEST_PER_SIDE || 5);
   const DURATION_MIN =
     durationMinArg !== undefined ? Number(durationMinArg) : Number(process.env.DURATION_MIN || 15);
+  const ALIGN_15M = toBool(align15mArg ?? process.env.ALIGN_15M, false);
+  const REPEAT = toBool(repeatArg ?? process.env.REPEAT, false);
   const POST_ONLY = toBool(postOnlyArg ?? process.env.POST_ONLY, true);
   const POLL_SEC = toNum(pollSecArg ?? process.env.POLL_SEC, 3);
   const PAIR_GRACE_SEC = toNum(pairGraceSecArg ?? process.env.PAIR_GRACE_SEC, 10);
@@ -251,281 +265,272 @@ async function main() {
   const signer = new Wallet(PRIVATE_KEY);
   const FUNDER_ADDRESS = funderArg || process.env.POLY_FUNDER_ADDRESS || signer.address;
 
-  console.log(`[${nowIso()}] Initializing client (derive creds)…`);
-  const bootstrapClient = new ClobClient(HOST, CHAIN_ID, signer);
+  async function runOneWindow({ windowStartMs }) {
+    console.log(`[${nowIso()}] Initializing client (derive creds)…`);
+    const bootstrapClient = new ClobClient(HOST, CHAIN_ID, signer);
 
-  // Per docs: private key is used once to derive User API credentials.
-  const userApiCreds = await bootstrapClient.createOrDeriveApiKey();
+    // Per docs: private key is used once to derive User API credentials.
+    const userApiCreds = await bootstrapClient.createOrDeriveApiKey();
 
-  console.log(`[${nowIso()}] Reinitializing client (authenticated)…`);
-  const client = new ClobClient(HOST, CHAIN_ID, signer, userApiCreds, SIGNATURE_TYPE, FUNDER_ADDRESS);
+    console.log(`[${nowIso()}] Reinitializing client (authenticated)…`);
+    const client = new ClobClient(HOST, CHAIN_ID, signer, userApiCreds, SIGNATURE_TYPE, FUNDER_ADDRESS);
 
-  // Fetch per-token market metadata (tickSize/negRisk).
-  console.log(`[${nowIso()}] Fetching market metadata…`);
-  const upMarket = await client.getMarket(UP_TOKEN_ID);
-  const downMarket = await client.getMarket(DOWN_TOKEN_ID);
+    // Fetch per-token market metadata (tickSize/negRisk).
+    console.log(`[${nowIso()}] Fetching market metadata…`);
+    const upMarket = await client.getMarket(UP_TOKEN_ID);
+    const downMarket = await client.getMarket(DOWN_TOKEN_ID);
 
-  const upTickSize = upMarket.tickSize;
-  const downTickSize = downMarket.tickSize;
-  const upNegRisk = upMarket.negRisk;
-  const downNegRisk = downMarket.negRisk;
+    const upTickSize = upMarket.tickSize;
+    const downTickSize = downMarket.tickSize;
+    const upNegRisk = upMarket.negRisk;
+    const downNegRisk = downMarket.negRisk;
 
-  const upPrice = roundDownToTick(PRICE, upTickSize);
-  const downPrice = roundDownToTick(PRICE, downTickSize);
+    const upPrice = roundDownToTick(PRICE, upTickSize);
+    const downPrice = roundDownToTick(PRICE, downTickSize);
 
-  const size =
-    sharesArg !== undefined ? Number(sharesArg) : computeSizeShares({ investUsd: INVEST_PER_SIDE, price: PRICE });
-  if (!Number.isFinite(size) || size <= 0) throw new Error(`Invalid size/shares ${size}`);
+    const size =
+      sharesArg !== undefined ? Number(sharesArg) : computeSizeShares({ investUsd: INVEST_PER_SIDE, price: PRICE });
+    if (!Number.isFinite(size) || size <= 0) throw new Error(`Invalid size/shares ${size}`);
 
-  // Quick market sanity checks (top-of-book), to avoid acting on obviously broken quotes.
-  // Market-maker guidance emphasizes monitoring orderbook / feeds continuously before quoting.
-  const upBook = await client.getOrderBook(UP_TOKEN_ID);
-  const downBook = await client.getOrderBook(DOWN_TOKEN_ID);
-  const upTop = parseOrderBookTop(upBook);
-  const downTop = parseOrderBookTop(downBook);
+    // Quick market sanity checks (top-of-book), to avoid acting on obviously broken quotes.
+    const upBook = await client.getOrderBook(UP_TOKEN_ID);
+    const downBook = await client.getOrderBook(DOWN_TOKEN_ID);
+    const upTop = parseOrderBookTop(upBook);
+    const downTop = parseOrderBookTop(downBook);
 
-  const isWeird = (x) => x !== null && (x <= 0 || x >= 1);
-  if (!ALLOW_WEIRD_QUOTES) {
-    if (isWeird(upTop.bestAsk) || isWeird(upTop.bestBid) || isWeird(downTop.bestAsk) || isWeird(downTop.bestBid)) {
-      throw new Error(
-        `Refusing: detected weird top-of-book quotes. ` +
-          `UP bid/ask=${upTop.bestBid}/${upTop.bestAsk}, DOWN bid/ask=${downTop.bestBid}/${downTop.bestAsk}. ` +
-          `Pass --allow-weird-quotes true if you want to ignore this (not recommended).`
-      );
+    const isWeird = (x) => x !== null && (x <= 0 || x >= 1);
+    if (!ALLOW_WEIRD_QUOTES) {
+      if (isWeird(upTop.bestAsk) || isWeird(upTop.bestBid) || isWeird(downTop.bestAsk) || isWeird(downTop.bestBid)) {
+        throw new Error(
+          `Refusing: detected weird top-of-book quotes. ` +
+            `UP bid/ask=${upTop.bestBid}/${upTop.bestAsk}, DOWN bid/ask=${downTop.bestBid}/${downTop.bestAsk}. ` +
+            `Pass --allow-weird-quotes true if you want to ignore this (not recommended).`
+        );
+      }
     }
-  }
 
-  // Optional scheduling: wait until a specific timestamp.
-  if (startAtArg) {
-    const startMs = parseIsoMs(startAtArg);
-    const delay = startMs - Date.now();
-    if (delay > 0) {
-      console.log(`[${nowIso()}] Waiting ${Math.ceil(delay / 1000)}s until --start-at ${startAtArg}…`);
-      await sleep(delay);
+    // If caller gave a windowStartMs, wait until then (agents-style "sleep until next cycle").
+    if (Number.isFinite(windowStartMs)) {
+      const delay = windowStartMs - Date.now();
+      if (delay > 0) {
+        console.log(`[${nowIso()}] Waiting ${Math.ceil(delay / 1000)}s until window start @ ${new Date(windowStartMs).toISOString()}…`);
+        await sleep(delay);
+      }
     }
-  }
 
-  console.log(`[${nowIso()}] Placing orders:`);
-  console.log(`- UP   token=${UP_TOKEN_ID}  price=${upPrice}  size=${size} shares`);
-  console.log(`- DOWN token=${DOWN_TOKEN_ID}  price=${downPrice}  size=${size} shares`);
-  console.log(`- postOnly=${POST_ONLY}  pollSec=${POLL_SEC}  pairGraceSec=${PAIR_GRACE_SEC}  onSingleFill=${ON_SINGLE_FILL}`);
+    console.log(`[${nowIso()}] Placing orders:`);
+    console.log(`- UP   token=${UP_TOKEN_ID}  price=${upPrice}  size=${size} shares`);
+    console.log(`- DOWN token=${DOWN_TOKEN_ID}  price=${downPrice}  size=${size} shares`);
+    console.log(`- postOnly=${POST_ONLY}  pollSec=${POLL_SEC}  pairGraceSec=${PAIR_GRACE_SEC}  onSingleFill=${ON_SINGLE_FILL}`);
 
-  const orderIds = [];
+    const orderIds = [];
 
-  const upResp = await client.createAndPostOrder(
-    {
-      tokenID: UP_TOKEN_ID,
-      price: upPrice,
-      size,
-      side: Side.BUY,
-    },
-    { tickSize: upTickSize, negRisk: upNegRisk },
-    OrderType.GTC,
-    undefined,
-    POST_ONLY
-  );
-  console.log(`[${nowIso()}] UP order: id=${upResp.orderID} status=${upResp.status}`);
-  orderIds.push(upResp.orderID);
+    const upResp = await client.createAndPostOrder(
+      {
+        tokenID: UP_TOKEN_ID,
+        price: upPrice,
+        size,
+        side: Side.BUY,
+      },
+      { tickSize: upTickSize, negRisk: upNegRisk },
+      OrderType.GTC,
+      undefined,
+      POST_ONLY
+    );
+    console.log(`[${nowIso()}] UP order: id=${upResp.orderID} status=${upResp.status}`);
+    orderIds.push(upResp.orderID);
 
-  const downResp = await client.createAndPostOrder(
-    {
-      tokenID: DOWN_TOKEN_ID,
-      price: downPrice,
-      size,
-      side: Side.BUY,
-    },
-    { tickSize: downTickSize, negRisk: downNegRisk },
-    OrderType.GTC,
-    undefined,
-    POST_ONLY
-  );
-  console.log(`[${nowIso()}] DOWN order: id=${downResp.orderID} status=${downResp.status}`);
-  orderIds.push(downResp.orderID);
+    const downResp = await client.createAndPostOrder(
+      {
+        tokenID: DOWN_TOKEN_ID,
+        price: downPrice,
+        size,
+        side: Side.BUY,
+      },
+      { tickSize: downTickSize, negRisk: downNegRisk },
+      OrderType.GTC,
+      undefined,
+      POST_ONLY
+    );
+    console.log(`[${nowIso()}] DOWN order: id=${downResp.orderID} status=${downResp.status}`);
+    orderIds.push(downResp.orderID);
 
-  const cancelAtMs = Date.now() + DURATION_MIN * 60 * 1000;
-  console.log(`[${nowIso()}] Will cancel remaining open orders in ${DURATION_MIN} minutes @ ${new Date(cancelAtMs).toISOString()}`);
+    const cancelAtMs = Date.now() + DURATION_MIN * 60 * 1000;
+    console.log(`[${nowIso()}] Will cancel remaining open orders in ${DURATION_MIN} minutes @ ${new Date(cancelAtMs).toISOString()}`);
 
-  // Optional RTDS client:
-  // - clob_user.order / clob_user.trade (authenticated) gives low-latency signals that *something* changed
-  // - activity.orders_matched/trades (unauth) can be subscribed by market_slug (if provided) for additional signals
-  // We still verify by calling getOrder(orderID) because RTDS payload schema doesn't guarantee an orderID linkage.
-  let rtdClient = null;
-  let rtdsTriggered = false;
-  if (USE_RTDS) {
-    try {
-      rtdClient = new RealTimeDataClient({
-        host: RTDS_HOST,
-        autoReconnect: true,
-        onConnect: (c) => {
-          console.log(`[${nowIso()}] RTDS connected. Subscribing…`);
-
-          // Auth subscription for user-specific events
-          const clob_auth = {
-            // clob-client uses apiKey naming; RTDS expects key
-            key: userApiCreds.apiKey ?? userApiCreds.key,
-            secret: userApiCreds.secret,
-            passphrase: userApiCreds.passphrase,
-          };
-
-          c.subscribe({
-            subscriptions: [
-              { topic: "clob_user", type: "order", clob_auth },
-              { topic: "clob_user", type: "trade", clob_auth },
-            ],
-          });
-
-          // Optional market-wide activity feed (requires market_slug filter)
-          if (MARKET_SLUG) {
+    // Optional RTDS client (see earlier logic).
+    let rtdClient = null;
+    let rtdsTriggered = false;
+    if (USE_RTDS) {
+      try {
+        rtdClient = new RealTimeDataClient({
+          host: RTDS_HOST,
+          autoReconnect: true,
+          onConnect: (c) => {
+            console.log(`[${nowIso()}] RTDS connected. Subscribing…`);
+            const clob_auth = {
+              key: userApiCreds.apiKey ?? userApiCreds.key,
+              secret: userApiCreds.secret,
+              passphrase: userApiCreds.passphrase,
+            };
             c.subscribe({
               subscriptions: [
-                { topic: "activity", type: "orders_matched", filters: JSON.stringify({ market_slug: MARKET_SLUG }) },
-                { topic: "activity", type: "trades", filters: JSON.stringify({ market_slug: MARKET_SLUG }) },
+                { topic: "clob_user", type: "order", clob_auth },
+                { topic: "clob_user", type: "trade", clob_auth },
               ],
             });
-          }
-        },
-        onMessage: (_c, msg) => {
-          // We treat any user order/trade message as a hint to check our order status immediately.
-          if (msg?.topic === "clob_user") {
-            rtdsTriggered = true;
-          }
-        },
-      }).connect();
-    } catch (e) {
-      console.log(`[${nowIso()}] RTDS init failed, falling back to polling: ${e?.message || String(e)}`);
-      rtdClient = null;
-    }
-  }
-
-  // Safety loop:
-  // - Poll matched sizes (size_matched) for each order
-  // - If one side fills and the other doesn't within PAIR_GRACE_SEC:
-  //   - hedge: try to complete the pair within a minimum profit bound, else cancel unfilled
-  //   - cancel: cancel unfilled (you are left with directional exposure from the filled side)
-  //   - wait: do nothing (highest exposure risk)
-  const eps = 1e-9;
-  let firstSingleFillAtMs = null;
-  let actedOnSingleFill = false;
-
-  while (Date.now() < cancelAtMs) {
-    // If RTDS is enabled, we can poll less aggressively unless RTDS says something changed.
-    // (We still do periodic polling to avoid missing events.)
-    if (USE_RTDS && rtdClient) {
-      if (!rtdsTriggered) {
-        await sleep(Math.max(POLL_SEC, 3) * 1000);
-        continue;
+            if (MARKET_SLUG) {
+              c.subscribe({
+                subscriptions: [
+                  { topic: "activity", type: "orders_matched", filters: JSON.stringify({ market_slug: MARKET_SLUG }) },
+                  { topic: "activity", type: "trades", filters: JSON.stringify({ market_slug: MARKET_SLUG }) },
+                ],
+              });
+            }
+          },
+          onMessage: (_c, msg) => {
+            if (msg?.topic === "clob_user") rtdsTriggered = true;
+          },
+        }).connect();
+      } catch (e) {
+        console.log(`[${nowIso()}] RTDS init failed, falling back to polling: ${e?.message || String(e)}`);
+        rtdClient = null;
       }
-      rtdsTriggered = false;
     }
 
-    const upOrder = await safeGetOrder(client, upResp.orderID);
-    const downOrder = await safeGetOrder(client, downResp.orderID);
+    // Safety loop
+    const eps = 1e-9;
+    let firstSingleFillAtMs = null;
+    let actedOnSingleFill = false;
 
-    const upMatched = parseMatchedShares(upOrder);
-    const downMatched = parseMatchedShares(downOrder);
-    const upOrig = parseOriginalShares(upOrder) || size;
-    const downOrig = parseOriginalShares(downOrder) || size;
-
-    const upFull = upMatched + eps >= upOrig;
-    const downFull = downMatched + eps >= downOrig;
-    const bothFull = upFull && downFull;
-
-    const upSome = upMatched > eps;
-    const downSome = downMatched > eps;
-    const oneSome = (upSome && !downSome) || (!upSome && downSome);
-
-    if (bothFull) {
-      console.log(`[${nowIso()}] Both legs fully filled. (upMatched=${upMatched}, downMatched=${downMatched})`);
-      // You can optionally cancel any remaining (should be none) and stop monitoring early.
-      break;
-    }
-
-    if (oneSome && !actedOnSingleFill) {
-      if (firstSingleFillAtMs === null) {
-        firstSingleFillAtMs = Date.now();
-        console.log(
-          `[${nowIso()}] Single-leg fill detected. upMatched=${upMatched} downMatched=${downMatched}. Starting grace timer (${PAIR_GRACE_SEC}s)…`
-        );
+    while (Date.now() < cancelAtMs) {
+      if (USE_RTDS && rtdClient) {
+        if (!rtdsTriggered) {
+          await sleep(Math.max(POLL_SEC, 3) * 1000);
+          continue;
+        }
+        rtdsTriggered = false;
       }
 
-      const elapsed = (Date.now() - firstSingleFillAtMs) / 1000;
-      if (elapsed >= PAIR_GRACE_SEC) {
-        actedOnSingleFill = true;
+      const upOrder = await safeGetOrder(client, upResp.orderID);
+      const downOrder = await safeGetOrder(client, downResp.orderID);
 
-        const filledSide = upMatched > downMatched ? "UP" : "DOWN";
-        const missingShares = Math.abs(upMatched - downMatched);
-        const otherToken = filledSide === "UP" ? DOWN_TOKEN_ID : UP_TOKEN_ID;
-        const otherTick = filledSide === "UP" ? downTickSize : upTickSize;
-        const otherNegRisk = filledSide === "UP" ? downNegRisk : upNegRisk;
+      const upMatched = parseMatchedShares(upOrder);
+      const downMatched = parseMatchedShares(downOrder);
+      const upOrig = parseOriginalShares(upOrder) || size;
+      const downOrig = parseOriginalShares(downOrder) || size;
 
-        console.log(
-          `[${nowIso()}] Grace elapsed. filledSide=${filledSide} missingShares=${missingShares}. Action=${ON_SINGLE_FILL}`
-        );
+      const upFull = upMatched + eps >= upOrig;
+      const downFull = downMatched + eps >= downOrig;
+      const bothFull = upFull && downFull;
 
-        if (ON_SINGLE_FILL === "wait") {
-          // Do nothing; continue monitoring until cancelAtMs.
-        } else if (ON_SINGLE_FILL === "cancel") {
-          const unfilledOrderId = filledSide === "UP" ? downResp.orderID : upResp.orderID;
-          const r = await cancelBestEffort(client, unfilledOrderId);
+      const upSome = upMatched > eps;
+      const downSome = downMatched > eps;
+      const oneSome = (upSome && !downSome) || (!upSome && downSome);
+
+      if (bothFull) {
+        console.log(`[${nowIso()}] Both legs fully filled. (upMatched=${upMatched}, downMatched=${downMatched})`);
+        break;
+      }
+
+      if (oneSome && !actedOnSingleFill) {
+        if (firstSingleFillAtMs === null) {
+          firstSingleFillAtMs = Date.now();
           console.log(
-            `[${nowIso()}] Cancel unfilled leg (${unfilledOrderId}) => ${r.ok ? "ok" : `failed: ${r.error}`}`
+            `[${nowIso()}] Single-leg fill detected. upMatched=${upMatched} downMatched=${downMatched}. Starting grace timer (${PAIR_GRACE_SEC}s)…`
           );
-        } else if (ON_SINGLE_FILL === "hedge") {
-          // Hedge rule:
-          // We only attempt hedging if the other leg can be bought while preserving MIN_HEDGE_EDGE.
-          // (Assumes filled leg price ~= PRICE; real average price depends on execution.)
-          const maxOtherPrice = 1 - PRICE - MIN_HEDGE_EDGE;
+        }
 
-          const otherBook = await client.getOrderBook(otherToken);
-          const otherTop = parseOrderBookTop(otherBook);
-          const bestAsk = otherTop.bestAsk;
+        const elapsed = (Date.now() - firstSingleFillAtMs) / 1000;
+        if (elapsed >= PAIR_GRACE_SEC) {
+          actedOnSingleFill = true;
+          const filledSide = upMatched > downMatched ? "UP" : "DOWN";
+          const missingShares = Math.abs(upMatched - downMatched);
+          const otherToken = filledSide === "UP" ? DOWN_TOKEN_ID : UP_TOKEN_ID;
+          const otherTick = filledSide === "UP" ? downTickSize : upTickSize;
+          const otherNegRisk = filledSide === "UP" ? downNegRisk : upNegRisk;
 
-          if (!Number.isFinite(bestAsk)) {
-            console.log(`[${nowIso()}] Hedge skipped: could not read best ask for other leg.`);
-          } else if (bestAsk > maxOtherPrice) {
-            console.log(
-              `[${nowIso()}] Hedge skipped: bestAsk=${bestAsk} exceeds maxOtherPrice=${maxOtherPrice.toFixed(6)} to keep edge >= ${MIN_HEDGE_EDGE}`
-            );
-          } else {
-            // Use a marketable limit order at maxOtherPrice to avoid paying above that.
-            const hedgePrice = roundDownToTick(maxOtherPrice, otherTick);
-            console.log(
-              `[${nowIso()}] Hedging by buying other leg token=${otherToken} shares=${missingShares} price<=${hedgePrice} (bestAsk=${bestAsk})`
-            );
+          console.log(
+            `[${nowIso()}] Grace elapsed. filledSide=${filledSide} missingShares=${missingShares}. Action=${ON_SINGLE_FILL}`
+          );
 
-            try {
-              const hedgeResp = await client.createAndPostOrder(
-                { tokenID: otherToken, price: hedgePrice, size: missingShares, side: Side.BUY },
-                { tickSize: otherTick, negRisk: otherNegRisk },
-                OrderType.GTC,
-                undefined,
-                false // not post-only: allow taking to complete hedge
+          if (ON_SINGLE_FILL === "wait") {
+            // no-op
+          } else if (ON_SINGLE_FILL === "cancel") {
+            const unfilledOrderId = filledSide === "UP" ? downResp.orderID : upResp.orderID;
+            const r = await cancelBestEffort(client, unfilledOrderId);
+            console.log(`[${nowIso()}] Cancel unfilled leg (${unfilledOrderId}) => ${r.ok ? "ok" : `failed: ${r.error}`}`);
+          } else if (ON_SINGLE_FILL === "hedge") {
+            const maxOtherPrice = 1 - PRICE - MIN_HEDGE_EDGE;
+            const otherBook = await client.getOrderBook(otherToken);
+            const otherTop = parseOrderBookTop(otherBook);
+            const bestAsk = otherTop.bestAsk;
+
+            if (!Number.isFinite(bestAsk)) {
+              console.log(`[${nowIso()}] Hedge skipped: could not read best ask for other leg.`);
+            } else if (bestAsk > maxOtherPrice) {
+              console.log(
+                `[${nowIso()}] Hedge skipped: bestAsk=${bestAsk} exceeds maxOtherPrice=${maxOtherPrice.toFixed(6)} to keep edge >= ${MIN_HEDGE_EDGE}`
               );
-              console.log(`[${nowIso()}] Hedge order posted: id=${hedgeResp.orderID} status=${hedgeResp.status}`);
-            } catch (e) {
-              console.log(`[${nowIso()}] Hedge failed: ${e?.message || String(e)}`);
+            } else {
+              const hedgePrice = roundDownToTick(maxOtherPrice, otherTick);
+              console.log(
+                `[${nowIso()}] Hedging by buying other leg token=${otherToken} shares=${missingShares} price<=${hedgePrice} (bestAsk=${bestAsk})`
+              );
+              try {
+                const hedgeResp = await client.createAndPostOrder(
+                  { tokenID: otherToken, price: hedgePrice, size: missingShares, side: Side.BUY },
+                  { tickSize: otherTick, negRisk: otherNegRisk },
+                  OrderType.GTC,
+                  undefined,
+                  false
+                );
+                console.log(`[${nowIso()}] Hedge order posted: id=${hedgeResp.orderID} status=${hedgeResp.status}`);
+              } catch (e) {
+                console.log(`[${nowIso()}] Hedge failed: ${e?.message || String(e)}`);
+              }
             }
           }
         }
       }
+
+      await sleep(POLL_SEC * 1000);
     }
 
-    await sleep(POLL_SEC * 1000);
+    if (rtdClient) {
+      try {
+        rtdClient.disconnect();
+      } catch {}
+    }
+
+    console.log(`[${nowIso()}] Cancelling orders (best-effort)…`);
+    for (const id of orderIds) {
+      const r = await cancelBestEffort(client, id);
+      console.log(`[${nowIso()}] Cancel ${id} => ${r.ok ? "ok" : `failed: ${r.error}`}`);
+    }
   }
 
-  if (rtdClient) {
-    try {
-      rtdClient.disconnect();
-    } catch {}
+  // Determine first start time:
+  // - explicit --start-at wins
+  // - else optionally align to next 15-minute boundary (common for "15m markets")
+  // - else start immediately
+  let firstWindowStartMs = null;
+  if (startAtArg) firstWindowStartMs = parseIsoMs(startAtArg);
+  else if (ALIGN_15M) firstWindowStartMs = ceilToWindowMs(Date.now(), 15);
+  else firstWindowStartMs = Date.now();
+
+  if (!REPEAT) {
+    await runOneWindow({ windowStartMs: firstWindowStartMs });
+    console.log(`[${nowIso()}] Done.`);
+    return;
   }
 
-  console.log(`[${nowIso()}] Cancelling orders (best-effort)…`);
-  for (const id of orderIds) {
-    const r = await cancelBestEffort(client, id);
-    console.log(`[${nowIso()}] Cancel ${id} => ${r.ok ? "ok" : `failed: ${r.error}`}`);
+  // Repeat forever in aligned windows. Each cycle computes the next boundary to avoid drift.
+  // (This is the key "agents-style" timer behavior: do work, then sleep until next tick.)
+  while (true) {
+    const nextStart = ceilToWindowMs(Date.now(), 15);
+    await runOneWindow({ windowStartMs: nextStart });
   }
-
-  console.log(`[${nowIso()}] Done.`);
 }
 
 main().catch((e) => {
