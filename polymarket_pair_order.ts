@@ -16,7 +16,7 @@ dotenv.config();
 
 import { ClobClient, OrderType, Side } from "@polymarket/clob-client";
 import type { ApiKeyCreds, ApiKeyRaw, OpenOrder, OrderBookSummary, TickSize } from "@polymarket/clob-client";
-import { RealTimeDataClient } from "@polymarket/real-time-data-client";
+import { RealTimeDataClient } from "@polymarket/real-time-data-client"; 
 import type { Message } from "@polymarket/real-time-data-client";
 import { Wallet } from "ethers";
 
@@ -45,6 +45,7 @@ Options:
   --duration-min <m>    Cancel open orders after m minutes (default: 15)
   --start-at <iso>      Wait until ISO timestamp before placing orders
   --align-15m <true|false>  If --start-at not provided, align start to next 15m boundary (default: false)
+  --align-market-start <true|false> If --start-at not provided, align start to the market start derived from --market-slug epoch (default: false)
   --repeat <true|false>  Repeat forever in 15m windows (default: false)
   --post-only <true|false>  Post-only for the initial pair orders (default: true)
   --poll-sec <s>        Poll open order status every s seconds (default: 3)
@@ -93,6 +94,18 @@ function nowIso(): string {
 function ceilToWindowMs(nowMs: number, windowMinutes: number): number {
   const windowMs = windowMinutes * 60 * 1000;
   return Math.ceil(nowMs / windowMs) * windowMs;
+}
+
+function parseMarketStartFromSlugMs(marketSlug: string): number {
+  // Many Polymarket slugs end with a unix timestamp in seconds.
+  // Example: btc-updown-15m-1767224700 -> 1767224700s -> 2025-12-31T23:45:00Z (market start)
+  const parts = marketSlug.split("-");
+  const last = parts[parts.length - 1];
+  const sec = Number(last);
+  if (!Number.isFinite(sec) || sec <= 0) {
+    throw new Error(`Cannot parse market start from market slug: ${marketSlug}`);
+  }
+  return Math.floor(sec * 1000);
 }
 
 function roundDownToTick(x: number, tickSize: TickSize | number): number {
@@ -208,6 +221,7 @@ async function main(): Promise<void> {
   const durationMinArg = getArgValue("--duration-min");
   const startAtArg = getArgValue("--start-at");
   const align15mArg = getArgValue("--align-15m");
+  const alignMarketStartArg = getArgValue("--align-market-start");
   const repeatArg = getArgValue("--repeat");
   const signatureTypeArg = getArgValue("--signature-type");
   const funderArg = getArgValue("--funder");
@@ -225,6 +239,7 @@ async function main(): Promise<void> {
   const INVEST_PER_SIDE = investArg !== undefined ? Number(investArg) : Number(process.env.INVEST_PER_SIDE ?? 5);
   const DURATION_MIN = durationMinArg !== undefined ? Number(durationMinArg) : Number(process.env.DURATION_MIN ?? 15);
   const ALIGN_15M = toBool(align15mArg ?? process.env.ALIGN_15M, false);
+  const ALIGN_MARKET_START = toBool(alignMarketStartArg ?? process.env.ALIGN_MARKET_START, false);
   const REPEAT = toBool(repeatArg ?? process.env.REPEAT, false);
   const POST_ONLY = toBool(postOnlyArg ?? process.env.POST_ONLY, true);
   const POLL_SEC = toNum(pollSecArg ?? process.env.POLL_SEC, 3);
@@ -490,7 +505,12 @@ async function main(): Promise<void> {
 
   let firstWindowStartMs: number;
   if (startAtArg) firstWindowStartMs = parseIsoMs(startAtArg);
-  else if (ALIGN_15M) firstWindowStartMs = ceilToWindowMs(Date.now(), 15);
+  else if (ALIGN_MARKET_START) {
+    if (!MARKET_SLUG) {
+      throw new Error(`--align-market-start requires --market-slug (or env MARKET_SLUG).`);
+    }
+    firstWindowStartMs = parseMarketStartFromSlugMs(MARKET_SLUG);
+  } else if (ALIGN_15M) firstWindowStartMs = ceilToWindowMs(Date.now(), 15);
   else firstWindowStartMs = Date.now();
 
   if (!REPEAT) {
@@ -500,7 +520,10 @@ async function main(): Promise<void> {
   }
 
   while (true) {
-    const nextStart = ceilToWindowMs(Date.now(), 15);
+    // Repeat every 15 minutes from the previous window start to avoid drift.
+    // Note: this does NOT automatically switch to the "next market slug/token IDs" — you must update those externally.
+    const nextStart = firstWindowStartMs + 15 * 60 * 1000;
+    firstWindowStartMs = nextStart;
     await runOneWindow({ windowStartMs: nextStart });
   }
 }
