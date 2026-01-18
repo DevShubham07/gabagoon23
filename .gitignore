@@ -1,5 +1,6 @@
 node_modules/
 data/
+dist/
 
 # Local/env files
 env_file.txt
